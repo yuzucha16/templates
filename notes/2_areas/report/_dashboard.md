@@ -1,225 +1,224 @@
 ---
-tags:
-  - report
-  - dashboard
+tags: [dashboard, report]
+title: ダッシュボード
+updated: <% tp.date.now("YYYY-MM-DD") %>
 ---
 
-# 📈 report dashboard
-
-※このノートは `2_areas/report/` に置く想定です  
-※月報は翌月分を15日に作る運用でも、ここは「今月分」を表示します
-
-## 🟦 1. 月報の計画（今月）
-
-```dataview
-table file.link as "File", month, period
-from "2_areas/report/monthly"
-where dateformat(month, "YYYY-MM") = dateformat(date(today), "YYYY-MM")
-   or dateformat(month, "YYYY-MM") = dateformat(date(today) + dur(1 month), "YYYY-MM")
-sort month asc
-limit 5
-```
+# 🗓 レポート ダッシュボード
 
 ---
-
-## 🟦 2. 日報からの実績集計（今月）
+## 🕒 進行状況（今週）
 
 ```dataviewjs
-const month = moment().format("YYYY-MM");
+//
+// 🕒 進行状況（今週）
+// 1. 最新の週報(実績)を1枚見つける
+// 2. その週報の start_date/end_date で日報をフィルタ
+// 3. タスクを @pm(...) / @work(...) / @ad-hoc(...) に分類して工数を合計
+//
 
-const tasks = dv.pages('"2_areas/report/daily"')
-  .where(p => p.file.name.startsWith(month))
-  .flatMap(p => p.file.tasks)
-  .filter(t => t.text);
+// 1. 最新の週報(実績)を探す
+const weekly = dv.pages('"2_areas/report/weekly"')
+  .where(p => (p.type ?? "") === "actual")
+  .sort(p => p.file.name, "desc")
+  .array()[0];
 
-function pick(text, re, def="未分類") {
-  const m = text.match(re);
-  return m ? m[1] : def;
+if (!weekly) {
+  dv.paragraph("📭 週報(実績)がまだありません。");
+} else {
+  // 週報が持っている期間
+  function toMomentAny(v) {
+    if (v && typeof v === "object" && typeof v.toISODate === "function") {
+      return moment(v.toISODate(), "YYYY-MM-DD", true);
+    }
+    if (typeof v === "string") {
+      const m = moment(v, ["YYYY-MM-DD", "YYYY/MM/DD"], true);
+      if (m.isValid()) return m;
+    }
+    return moment.invalid();
+  }
+
+  const start = toMomentAny(weekly.start_date);
+  const end   = toMomentAny(weekly.end_date);
+
+  if (!start.isValid() || !end.isValid()) {
+    dv.paragraph("⚠ この週報には start_date / end_date がありません。");
+  } else {
+    // 2. 日報を全部とって、この週の範囲だけにする
+    const dailies = dv.pages('"2_areas/report/daily"').array();
+
+    function dailyDate(p) {
+      if (p.date) {
+        const m = moment(p.date, ["YYYY-MM-DD", "YYYY/MM/DD"], true);
+        if (m.isValid()) return m;
+        if (typeof p.date === "object" && typeof p.date.toISODate === "function") {
+          return moment(p.date.toISODate(), "YYYY-MM-DD", true);
+        }
+      }
+      return moment(p.file.name, "YYYY-MM-DD", true);
+    }
+
+    // 3. 分類ごとの集計器
+    const buckets = new Map();  // key -> {plan, act, count}
+    function ensureBucket(key) {
+      if (!buckets.has(key)) {
+        buckets.set(key, { plan: 0, act: 0, count: 0 });
+      }
+      return buckets.get(key);
+    }
+
+    for (const p of dailies) {
+      const d = dailyDate(p);
+      if (!d.isValid() || !d.isBetween(start, end, "day", "[]")) continue;
+
+      const tasks = p.file.tasks ?? [];
+      for (const t of tasks) {
+        const txt = t.text ?? "";
+
+        // タグ検出
+        const pm   = txt.match(/@pm\(([^)]*)\)/);
+        const work = txt.match(/@work\(([^)]*)\)/);
+        const adh  = txt.match(/@ad-hoc\(([^)]*)\)/);
+
+        let key = "その他";
+        if (pm)   key = `@pm(${pm[1]})`;
+        else if (work) key = `@work(${work[1]})`;
+        else if (adh)  key = `@ad-hoc(${adh[1]})`;
+
+        const plan = Number(txt.match(/⏰\s*([0-9.]+)h/)?.[1] ?? "0");
+        const act  = Number(txt.match(/⏱\s*([0-9.]+)h/)?.[1] ?? "0");
+
+        const b = ensureBucket(key);
+        b.plan += plan;
+        b.act  += act;
+        b.count += 1;
+      }
+    }
+
+    // 合計バケットを作る
+    let totalPlan = 0, totalAct = 0;
+    for (const [, v] of buckets) {
+      totalPlan += v.plan;
+      totalAct  += v.act;
+    }
+    buckets.set("— 合計 —", { plan: totalPlan, act: totalAct, count: 0 });
+
+    // 表示用に並び替え（合計を最後に）
+    const rows = Array.from(buckets.entries())
+      .filter(([k,_]) => k !== "— 合計 —")
+      .sort((a, b) => b[1].plan - a[1].plan);
+
+    rows.push(["— 合計 —", buckets.get("— 合計 —")]);
+
+    // 4. 出力
+    dv.paragraph(`🗓 対象週: ${start.format("YYYY-MM-DD")} 〜 ${end.format("YYYY-MM-DD")}`);
+
+    dv.table(
+      ["分類", "計画[h]", "実績[h]", "乖離[h]", "進捗[%]"],
+      rows.map(([name, v]) => {
+        const diff = v.act - v.plan;
+        const prog = v.plan > 0 ? (v.act / v.plan * 100).toFixed(1) : (v.act > 0 ? "100.0" : "0.0");
+        return [
+          name,
+          v.plan.toFixed(1),
+          v.act.toFixed(1),
+          diff.toFixed(1),
+          prog
+        ];
+      })
+    );
+  }
 }
-
-let bucket = { pm: {}, work: {}, adhoc: {} };
-
-for (let t of tasks) {
-  const plan   = parseFloat((t.text.match(/⏰ ([0-9.]+)h/)||[0,0])[1]);
-  const actual = parseFloat((t.text.match(/⏱ ([0-9.]+)h/)||[0,0])[1]);
-
-  const pm    = pick(t.text, /@pm\(([^)]+)\)/, null);
-  const work  = pick(t.text, /@work\(([^)]+)\)/, null);
-  const adhoc = pick(t.text, /@ad-hoc\(([^)]+)\)/, null);
-
-  if (pm) {
-    if (!bucket.pm[pm]) bucket.pm[pm] = {plan:0, actual:0};
-    bucket.pm[pm].plan   += plan  || 0;
-    bucket.pm[pm].actual += actual|| 0;
-  }
-  if (work) {
-    if (!bucket.work[work]) bucket.work[work] = {plan:0, actual:0};
-    bucket.work[work].plan   += plan  || 0;
-    bucket.work[work].actual += actual|| 0;
-  }
-  if (adhoc) {
-    if (!bucket.adhoc[adhoc]) bucket.adhoc[adhoc] = {plan:0, actual:0};
-    bucket.adhoc[adhoc].plan   += plan  || 0;
-    bucket.adhoc[adhoc].actual += actual|| 0;
-  }
-}
-
-dv.header(3, "🗂 PM別 実績（今月）");
-dv.table(["PM分類","計画[h]","実績[h]","乖離[h]"],
-  Object.entries(bucket.pm).map(([k,v]) => [k, v.plan.toFixed(1), v.actual.toFixed(1), (v.actual - v.plan).toFixed(1)])
-);
-
-dv.header(3, "💼 Work別 実績（今月）");
-dv.table(["PJ分類","計画[h]","実績[h]","乖離[h]"],
-  Object.entries(bucket.work).map(([k,v]) => [k, v.plan.toFixed(1), v.actual.toFixed(1), (v.actual - v.plan).toFixed(1)])
-);
-
-dv.header(3, "⚡ 突発(Ad-hoc)（今月）");
-dv.table(["分類","計画[h]","実績[h]","乖離[h]"],
-  Object.entries(bucket.adhoc).map(([k,v]) => [k, v.plan.toFixed(1), v.actual.toFixed(1), (v.actual - v.plan).toFixed(1)])
-);
 ```
 
 ---
 
-## 🟦 3. 今週の進捗（水曜→火曜）
-
-```dataviewjs
-// ===== 設定 =====
-const ROOT = "2_areas/report/daily";
-
-// 0. 全dailyを取る（必ず .array() にする）
-const allPages = dv.pages(`"${ROOT}"`).array();
-if (allPages.length === 0) {
-  dv.paragraph("まだ日報がありません");
-  return;
-}
-
-// 1. 日付を取る関数（frontmatter優先→ファイル名）
-const getDate = (p) => {
-  if (p.date) {
-    const m = moment(p.date);
-    if (m.isValid()) return m;
-  }
-  const m2 = moment(p.file.name, "YYYY-MM-DD", true);
-  return m2.isValid() ? m2 : null;
-};
-
-// 2. 最新の日報の日付を基準に「その週(水→火)」を決める
-const latest = allPages
-  .map(p => ({ p, d: getDate(p) }))
-  .filter(x => x.d && x.d.isValid())
-  .sort((a, b) => b.d.valueOf() - a.d.valueOf())[0];
-
-const base = latest.d.clone();          // この日付を基準にする
-const dow  = base.day();                // 0=日,1=月,...,3=水
-const start = base.clone().subtract((dow - 3 + 7) % 7, "days").startOf("day"); // その週の水曜
-const end   = start.clone().add(6, "days").endOf("day");                        // 翌週火曜
-
-// 3. その週に入っている daily だけに絞る
-const weekPages = allPages.filter(p => {
-  const d = getDate(p);
-  return d && d.isBetween(start, end, null, "[]");
-});
-
-// 4. タスクっぽい行を全部拾う（タスクが無くても本文から拾う）
-const tasks = [];
-for (const p of weekPages) {
-  // 4-1. dataviewが見つけてくれたチェックボックス
-  const dvTasks = (p.file.tasks ?? []).map(t => ({
-    text: t.text ?? "",
-    source: p.file.path,
-  }));
-
-  // 4-2. 念のため内容を読み込んで @work(...) / ⏱ ... を拾う
-  const content = await dv.io.load(p.file.path);
-  const lineTasks = content
-    .split("\n")
-    .filter(l => /@pm|@work|@ad-hoc|⏰|⏱|🔼/.test(l))
-    .map(l => ({
-      text: l.trim(),
-      source: p.file.path,
-    }));
-
-  tasks.push(...dvTasks, ...lineTasks);
-}
-
-// 5. 集計（タグは自動検出）
-const tagPattern = /@(pm|work|ad-hoc)\(([^)]+)\)/g;
-const results = {};
-
-for (const t of tasks) {
-  const text = t.text ?? "";
-
-  const planMatch   = text.match(/⏰ ([0-9.]+)h/);
-  const actualMatch = text.match(/⏱ ([0-9.]+)h/);
-  const progMatch   = text.match(/🔼 ([0-9]+)%/);
-
-  const plan   = planMatch   ? parseFloat(planMatch[1]) : 0;
-  const actual = actualMatch ? parseFloat(actualMatch[1]) : 0;
-  const prog   = progMatch   ? parseInt(progMatch[1])    : null;
-
-  let m;
-  while ((m = tagPattern.exec(text)) !== null) {
-    const key = `@${m[1]}(${m[2]})`;     // 例: @work(PJ1), @pm(部共通)
-
-    if (!results[key]) {
-      results[key] = { plan: 0, actual: 0, progSum: 0, progCount: 0 };
-    }
-    results[key].plan   += plan;
-    results[key].actual += actual;
-    if (prog !== null) {
-      results[key].progSum   += prog;
-      results[key].progCount += 1;
-    }
-  }
-}
-
-// 6. 表にする
-const rows = Object.entries(results)
-  .sort((a, b) => b[1].actual - a[1].actual)
-  .map(([k, v]) => {
-    const diff = v.actual - v.plan;
-    const avg  = v.progCount ? (v.progSum / v.progCount).toFixed(0) + "%" : "";
-    return [
-      k,
-      v.plan.toFixed(1),
-      v.actual.toFixed(1),
-      diff.toFixed(1),
-      avg,
-    ];
-  });
-
-// 7. 合計行
-const totalPlan   = rows.reduce((s, r) => s + Number(r[1]), 0);
-const totalActual = rows.reduce((s, r) => s + Number(r[2]), 0);
-const totalDiff   = totalActual - totalPlan;
-
-// 8. 出力
-dv.header(3, `📆 今週 (${start.format("YYYY-MM-DD")}〜${end.format("YYYY-MM-DD")}) 実績`);
-dv.table(
-  ["分類", "計画[h]", "実績[h]", "乖離[h]", "進捗(平均)"],
-  [
-    ...rows,
-    ["— 合計 —", totalPlan.toFixed(1), totalActual.toFixed(1), totalDiff.toFixed(1), ""],
-  ]
-);
-```
-
----
-
-## 🟦 4. 日報の入力確認（直近7件）
+## 📅 今月の月報
 
 ```dataview
-list
-from "2_areas/report/daily"
-sort file.name desc
-limit 7
+TABLE WITHOUT ID
+  link(file.link, file.name) AS "月報ファイル",
+  type AS "タイプ",
+  month AS "対象月",
+  file.mtime AS "更新日時"
+FROM "2_areas/report/monthly"
+SORT file.name DESC
+LIMIT 2
 ```
 
 ---
 
-## 📝 5. メモ
-- 今月の所感：
-- 来月に寄せるもの：
-- 突発が多かった要因：
+## 📆 今週の週報
+
+```dataview
+TABLE WITHOUT ID
+  link(file.link, file.name) AS "週報ファイル",
+  type AS "タイプ",
+  week AS "週番号",
+  start_date AS "開始日",
+  end_date AS "終了日"
+FROM "2_areas/report/weekly"
+SORT file.name DESC
+LIMIT 3
+```
+
+---
+
+## 🧾 最近の日報
+
+```dataview
+TABLE WITHOUT ID
+  link(file.link, file.name) AS "日報",
+  date AS "日付",
+  file.mtime AS "更新日時"
+FROM "2_areas/report/daily"
+SORT date DESC
+LIMIT 7
+```
+
+---
+
+## 📈 実績サマリ（週次）
+
+```dataviewjs
+const weeklies = dv.pages('"2_areas/report/weekly"')
+  .where(p => p.type && p.type == "actual")
+  .sort(p => p.file.name, 'desc')
+  .limit(1)
+  .array();
+
+if (weeklies.length == 0) {
+  dv.paragraph("📭 実績週報がまだありません。");
+} else {
+  const w = weeklies[0];
+  dv.paragraph(`📘 最新週報: [${w.file.name}](${w.file.path})`);
+  dv.paragraph(`期間: ${w.start_date}〜${w.end_date}`);
+}
+```
+
+---
+
+## 📊 実績サマリ（月次）
+
+```dataviewjs
+const monthlies = dv.pages('"2_areas/report/monthly"')
+  .where(p => p.type && p.type == "actual")
+  .sort(p => p.file.name, 'desc')
+  .limit(1)
+  .array();
+
+if (monthlies.length == 0) {
+  dv.paragraph("📭 実績月報がまだありません。");
+} else {
+  const m = monthlies[0];
+  dv.paragraph(`📘 最新月報: [${m.file.name}](${m.file.path})`);
+  dv.paragraph(`対象月: ${m.month}`);
+}
+```
+
+---
+## 🪞 メモ・ToDoリンク
+
+- [[2_areas/report/daily/]]
+- [[2_areas/report/weekly/]]
+- [[2_areas/report/monthly/]]
